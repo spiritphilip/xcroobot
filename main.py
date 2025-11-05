@@ -4,6 +4,14 @@ import openai
 import requests
 from datetime import datetime
 
+import requests
+TELEGRAM_TOKEN = "8338844513:AAGkGXFUV_O01Hawf7xrbnazTpcrEJ6Ivz0"
+TELEGRAM_CHAT_ID = "-1003154953254"
+
+test_message = "✅ Test message from Xcroo Bot — connection verified."
+requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+              data={"chat_id": TELEGRAM_CHAT_ID, "text": test_message})
+
 # Environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
