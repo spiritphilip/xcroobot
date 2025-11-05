@@ -15,7 +15,7 @@ FEEDS = [
     "https://remotive.com/remote-jobs/feed"  # Remotive Blockchain
 ]
 
-KEYWORDS = ["web3", "design", "marketing", "frontend", "blockchain", "crypto", "solidity", "data", "defi", "business", "ethereum", "developer", "manager"]
+KEYWORDS = ["web3", "design", "marketing", "content", "analyst", "specialist", "frontend", "blockchain", "crypto", "solidity", "data", "defi", "business", "ethereum", "developer", "manager"]
 POSTED_FILE = "posted.txt"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -100,7 +100,7 @@ def format_for_telegram(job):
         f"{esc(company)} is hiring "
         f"[{esc(title)}]({link})\n\n"
         f"*About:* {esc(description)}\n\n"
-        f"#XCROO #OnChainTalent #Web3Jobs #FullStack"
+        f"#XCROO #OnChainTalent #Web3Jobs"
     )
     return formatted
 
