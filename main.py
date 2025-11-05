@@ -5,11 +5,11 @@ import requests
 from datetime import datetime
 
 # Environment variables
-OPENAI_API_KEY = os.getenv("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")
-BOT_TOKEN = os.getenv("8338844513:AAGkGXFUV_O01Hawf7xrbnazTpcrEJ6Ivz0")
-CHAT_ID = os.getenv("1003154953254")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Feeds to fetch
+# Feeds to fetch 
 FEEDS = [
     "https://cryptojoblist.com/jobs.rss",
     "https://remotive.com/remote-jobs/blockchain.rss",
