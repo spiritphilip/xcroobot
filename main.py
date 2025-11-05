@@ -20,7 +20,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Feeds to fetch 
 FEEDS = [
     "https://cryptojoblist.com/jobs.rss",
-    "https://remotive.com/remote-jobs/blockchain.rss",
+    "https://remotive.com/remote-jobs/feed",
     "https://rss.app/feeds/gE9CSXedtEJIRnpS.xml"
 ]
 
