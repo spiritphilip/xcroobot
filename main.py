@@ -15,7 +15,7 @@ FEEDS = [
     "https://remotive.com/remote-jobs/feed"  # Remotive Blockchain
 ]
 
-KEYWORDS = ["web3", "blockchain", "crypto", "defi", "solidity", "nft", "ethereum", "smart contract"]
+KEYWORDS = ["web3", "design", "marketing", "frontend", "blockchain", "crypto", "solidity", "data", "defi", "business", "ethereum", "developer", "manager"]
 POSTED_FILE = "posted.txt"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
