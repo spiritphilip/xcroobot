@@ -1,134 +1,148 @@
 import os
+import time
 import feedparser
 import requests
-import openai
-import time
-import re
+from datetime import datetime
+from openai import OpenAI
 
-# ===== CONFIG =====
+# ========== CONFIGURATION ==========
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 FEEDS = [
-
     "https://api.cryptojobslist.com/jobs.rss",     # CryptoJobList
     "https://remotive.com/remote-jobs/feed"  # Remotive Blockchain
 ]
 
-KEYWORDS = ["web3", "design", "marketing", "frontend", "blockchain", "crypto", "solidity", "defi", "business", "ethereum", "developer", "manager"]
+KEYWORDS = ["web3", "blockchain", "crypto", "defi", "solidity", "nft", "ethereum", "smart contract"]
 POSTED_FILE = "posted.txt"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-openai.api_key = OPENAI_API_KEY
+# ========== HELPERS ==========
 
-
-# ===== UTILITIES =====
-def read_posted():
+def load_posted():
     if not os.path.exists(POSTED_FILE):
         return set()
     with open(POSTED_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
+        return set(line.strip() for line in f.readlines())
 
-
-def write_posted(posted):
+def save_posted(posted_set):
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
-        for url in posted:
+        for url in posted_set:
             f.write(url + "\n")
 
+def fetch_jobs():
+    jobs = []
+    for feed_url in FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
+                link = entry.get("link", "")
+                lower = f"{title} {summary}".lower()
+                if any(k in lower for k in KEYWORDS):
+                    jobs.append({
+                        "title": title,
+                        "description": summary,
+                        "link": link,
+                        "company": entry.get("author", "Company"),
+                    })
+        except Exception as e:
+            print(f"Error parsing feed {feed_url}: {e}")
+    return jobs
 
-def clean_html(raw_html):
-    return re.sub(re.compile("<.*?>"), "", raw_html)
-
-
-# ===== AI SHORT SUMMARY =====
-def summarize_with_openai(title, description, link):
-    prompt = f"""
-Summarize this Web3 job posting in 2 short lines for Telegram.
-Keep it clean and professional. No emojis.
-
-Title: {title}
-Description: {description}
-Link: {link}
-"""
+def call_openai_summary(text):
     try:
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
-            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Summarize job posts cleanly in one sentence for a professional feed."},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=80,
+            temperature=0.6
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[ERROR] OpenAI error: {e}")
-        return f"{title}\n{link}"
+        print("OpenAI API Error:", e)
+        return text[:200]
 
+# ========== FORMATTER ==========
 
-# ===== TELEGRAM POST =====
-def send_to_telegram(text):
+def format_for_telegram(job):
+    """
+    Format each job post in clean Markdown style for Telegram.
+    """
+    title = job.get("title", "Job Opening").strip()
+    company = job.get("company", "A company").strip()
+    link = job.get("link", "").strip()
+    description = job.get("description", "").strip()
+
+    if len(description) > 300:
+        description = description[:300].rstrip() + "..."
+
+    # Markdown-safe escape
+    def esc(text):
+        return (
+            text.replace("_", "\\_")
+                .replace("*", "\\*")
+                .replace("[", "\\[")
+                .replace("`", "\\`")
+                .replace("(", "\\(")
+                .replace(")", "\\)")
+        )
+
+    formatted = (
+        f"*XCROO Job Update*\n\n"
+        f"{esc(company)} is hiring "
+        f"[{esc(title)}]({link})\n\n"
+        f"*About:* {esc(description)}\n\n"
+        f"#XCROO #OnChainTalent #Web3Jobs #FullStack"
+    )
+    return formatted
+
+# ========== TELEGRAM POSTING ==========
+
+def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": False,
+        "text": message,
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": True
     }
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code == 200:
-            print(f"[✅] Posted successfully to Telegram.")
-        else:
-            print(f"[❌] Telegram post failed: {r.status_code} - {r.text}")
-    except Exception as e:
-        print(f"[ERROR] Telegram error: {e}")
+    r = requests.post(url, json=payload)
+    if not r.ok:
+        print("Telegram post failed:", r.text)
+    else:
+        print("Posted to Telegram ✅")
 
+# ========== MAIN EXECUTION ==========
 
-# ===== MAIN JOB FETCHER =====
 def main():
-    posted = read_posted()
-    new_posted = set(posted)
+    print(f"XCROO BOT RUN STARTED: {datetime.utcnow()} UTC")
 
-    print(f"\n========== XCROO BOT START ==========")
-    print(f"Loaded {len(posted)} previously posted jobs.\n")
+    posted = load_posted()
+    jobs = fetch_jobs()
 
-    for feed_url in FEEDS:
-        print(f"\n[DEBUG] Checking feed: {feed_url}")
-        feed = feedparser.parse(feed_url)
-        if not feed.entries:
-            print("  [!] No entries found in feed.")
-            continue
+    new_jobs = [job for job in jobs if job["link"] not in posted]
 
-        for entry in feed.entries:
-            title = entry.get("title", "")
-            summary = clean_html(entry.get("summary", ""))
-            link = entry.get("link", "")
+    print(f"Fetched {len(jobs)} jobs, {len(new_jobs)} new ones.")
 
-            print(f" - Found job: {title}")
+    for job in new_jobs:
+        desc = call_openai_summary(job["description"])
+        job["description"] = desc
+        message = format_for_telegram(job)
+        send_telegram_message(message)
+        posted.add(job["link"])
+        time.sleep(5)  # Avoid Telegram rate limit
 
-            if link in posted:
-                continue
-
-            # Keyword filter
-            text_blob = f"{title.lower()} {summary.lower()}"
-            if not any(keyword in text_blob for keyword in KEYWORDS):
-                continue
-
-            print(f"   [MATCH] {title}")
-
-            # Summarize
-            message = summarize_with_openai(title, summary, link)
-            formatted_message = f"{message}\n\n#xcroo\n\n🔗 {link}"
-
-            # Post to Telegram
-            send_to_telegram(formatted_message)
-
-            # Mark as posted
-            new_posted.add(link)
-
-            # Respect API limits
-            time.sleep(3)
-
-    write_posted(new_posted)
-    print("\n========== XCROO BOT END ==========\n")
-
+    save_posted(posted)
+    print("XCROO BOT RUN COMPLETE ✅")
 
 if __name__ == "__main__":
     main()
+
