@@ -7,12 +7,12 @@ import re
 
 # ===== CONFIG =====
 FEEDS = [
-    "https://rss.app/feeds/gE9CSXedtEJIRnpS.xml",  # LinkedIn
-    "https://cryptojoblist.com/jobs.rss",           # CryptoJobList
-    "https://remotive.com/remote-jobs/blockchain.rss"  # Remotive Blockchain
+
+    "https://api.cryptojobslist.com/jobs.rss",     # CryptoJobList
+    "https://remotive.com/remote-jobs/feed"  # Remotive Blockchain
 ]
 
-KEYWORDS = ["web3", "blockchain", "crypto", "solidity", "defi", "nft", "ethereum", "developer", "smart contract"]
+KEYWORDS = ["web3", "design", "marketing", "frontend", "blockchain", "crypto", "solidity", "defi", "business", "ethereum", "developer", "manager"]
 POSTED_FILE = "posted.txt"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
