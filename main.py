@@ -2,145 +2,173 @@ import os
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-import openai
-import time
+from openai import OpenAI
+from datetime import datetime
+import csv
 
-# --- Configuration ---
+# ====== CONFIG ======
 FEEDS = [
-    "https://www.remote3.co/api/rss",
+     "https://www.remote3.co/api/rss",
     "https://api.cryptojobslist.com/jobs.rss",
     "https://remotive.com/remote-jobs/feed",
     "https://linkedin.com/jobs/search?keywords=&location=Worldwide&geoId=92000000&trk=public_jobs_jobs-search-bar_search-submit"
+
 ]
 
+KEYWORDS = ["web3", "design", "marketing", "content", "analyst", "specialist", "frontend", "blockchain", "crypto", "solidity", "data", "defi", "business", "ethereum", "developer", "manager"]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
 POSTED_FILE = "posted.txt"
+INCOMPLETE_LOG = "incomplete_jobs.csv"
 
-# --- Environment Variables (from GitHub Secrets) ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+client = OpenAI(api_key=OPENAI_KEY)
 
-openai.api_key = OPENAI_API_KEY
-
-
-# --- Load posted links ---
+# ====== HELPERS ======
 def load_posted():
     if not os.path.exists(POSTED_FILE):
         return set()
     with open(POSTED_FILE, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+        return set(line.strip() for line in f)
 
-
-# --- Save posted links ---
 def save_posted(posted):
     with open(POSTED_FILE, "w") as f:
-        f.write("\n".join(posted))
+        for p in posted:
+            f.write(p + "\n")
 
+def log_incomplete(job):
+    """Log incomplete jobs for later review."""
+    header = ["date", "title", "link", "company", "summary"]
+    exists = os.path.exists(INCOMPLETE_LOG)
+    with open(INCOMPLETE_LOG, "a", newline='', encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "title": job.get("title", "N/A"),
+            "link": job.get("link", "N/A"),
+            "company": job.get("company", "N/A"),
+            "summary": job.get("summary", "N/A")
+        })
 
-# --- Scrape job page for more content ---
-def scrape_page(url):
+def fetch_job_description(link):
+    """Try to scrape job summary or meta description."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Try to find a short meaningful text
+        res = requests.get(link, headers=headers, timeout=8)
+        if res.status_code != 200:
+            return None
+        soup = BeautifulSoup(res.text, "html.parser")
+        desc = soup.find("meta", attrs={"name": "description"})
+        if desc and desc.get("content"):
+            return desc["content"].strip()
         paragraphs = soup.find_all("p")
-        text = " ".join(p.get_text().strip() for p in paragraphs[:5])
-        return text[:1000] if text else "No detailed description found."
+        if paragraphs:
+            return " ".join(p.text.strip() for p in paragraphs[:2])
     except Exception:
-        return "No detailed description available."
+        pass
+    return None
 
-
-# --- Summarize job using GPT ---
-def summarize_with_gpt(title, company, content):
-    prompt = f"""
-Summarize the job posting below in one short professional paragraph (max 50 words).
-Job Title: {title}
-Company: {company}
-Description: {content}
-
-Then suggest exactly 2 relevant short hashtags (no # sign, just words) fitting the job type or field.
-Return as JSON with fields: "summary" and "hashtags".
-"""
+def call_openai_summary(prompt):
+    """Generate concise text using OpenAI."""
     try:
-        response = openai.ChatCompletion.create(
+        completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
+            temperature=0.6
         )
-        text = response["choices"][0]["message"]["content"]
-        # Extract summary + hashtags manually if not JSON formatted
-        summary, hashtags = text, []
-        if "{" in text and "}" in text:
-            import json
-            try:
-                parsed = json.loads(text)
-                summary = parsed.get("summary", summary)
-                hashtags = parsed.get("hashtags", [])
-            except Exception:
-                pass
-        return summary.strip(), hashtags
+        return completion.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI error:", e)
-        return "Short job summary unavailable.", []
+        print(f"OpenAI error: {e}")
+        return None
 
+def extract_company(title):
+    """Extract possible company name from job title."""
+    parts = title.split(" at ")
+    if len(parts) > 1:
+        return parts[-1].strip()
+    return None
 
-# --- Send to Telegram ---
-def send_to_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-    }
-    r = requests.post(url, json=payload)
-    if not r.ok:
-        print("Telegram error:", r.text)
+def post_to_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    r = requests.post(url, data=data)
+    return r.status_code == 200
 
-
-# --- Format post ---
-def format_post(title, link, company, summary, hashtags):
-    hashtag_text = " ".join([f"#{tag}" for tag in (['XCROO', 'OnChainTalent', 'Web3Jobs'] + hashtags)])
-    msg = f"*XCROO Job Update*\n\n*{company}* is hiring [{title}]({link})\n\n*About:* {summary}\n\n{hashtag_text}"
-    return msg
-
-
-# --- Main loop ---
+# ====== MAIN LOGIC ======
 def main():
     posted = load_posted()
     new_posted = set(posted)
 
     for feed_url in FEEDS:
-        print(f"Fetching {feed_url} ...")
+        print(f"Fetching feed: {feed_url}")
         feed = feedparser.parse(feed_url)
+
         for entry in feed.entries:
-            link = entry.link
+            link = entry.get("link", "")
+            title = entry.get("title", "").strip()
+            summary = entry.get("summary", "").strip() if "summary" in entry else ""
+            company = entry.get("author", "") or extract_company(title)
+            lower_title = title.lower()
+
             if link in posted:
                 continue
 
-            title = entry.title if hasattr(entry, "title") else "Untitled Role"
-            company = (
-                getattr(entry, "author", None)
-                or getattr(entry, "source", None)
-                or "Company not specified"
+            # Filter by keywords
+            if not any(k in lower_title for k in KEYWORDS):
+                continue
+
+            # Try scraping for better summary
+            if not summary:
+                scraped = fetch_job_description(link)
+                if scraped:
+                    summary = scraped
+
+            # AI enrichment if still missing
+            if not summary or not company:
+                ai_prompt = f"""
+You are helping summarize Web3 job posts.
+Title: {title}
+Company: {company or 'Unknown'}
+Link: {link}
+
+If company is missing, infer it if possible. Write a 1-line human summary about what the company is hiring for.
+"""
+                ai_result = call_openai_summary(ai_prompt)
+                if ai_result:
+                    summary = ai_result
+                    if not company:
+                        company_guess = extract_company(ai_result)
+                        if company_guess:
+                            company = company_guess
+
+            # If still missing key fields, log and skip posting
+            if not company or not summary:
+                log_incomplete({"title": title, "link": link, "company": company, "summary": summary})
+                continue
+
+            # Generate 2 extra hashtags
+            tag_prompt = f"Suggest two short, relevant hashtags for this job: {title}, {summary}. Only return hashtags, no explanations."
+            tags = call_openai_summary(tag_prompt) or "#Hiring #Blockchain"
+
+            # Build Telegram message
+            message = (
+                f"*XCROO Job Update*\n\n"
+                f"*{company}* is hiring [{title}]({link})\n\n"
+                f"*About:* {summary}\n\n"
+                f"#XCROO #OnChainTalent #Web3Jobs {tags}"
             )
 
-            description = scrape_page(link)
-            summary, hashtags = summarize_with_gpt(title, company, description)
-            message = format_post(title, link, company, summary, hashtags)
-            send_to_telegram(message)
-            print(f"Posted: {title}")
-
-            new_posted.add(link)
-            time.sleep(3)  # small delay to avoid spam rate-limits
+            if post_to_telegram(message):
+                print(f"✅ Posted: {title}")
+                new_posted.add(link)
+            else:
+                print(f"⚠️ Failed to post: {title}")
 
     save_posted(new_posted)
-    print("✅ Done!")
-
 
 if __name__ == "__main__":
     main()
-
 
