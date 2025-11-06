@@ -1,16 +1,11 @@
 import os
-import time
-import requests
 import feedparser
-from datetime import datetime, timedelta
+import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
+import openai
+import time
 
-# ========= CONFIG =========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
+# --- Configuration ---
 FEEDS = [
     "https://www.remote3.co/api/rss",
     "https://api.cryptojobslist.com/jobs.rss",
@@ -19,159 +14,133 @@ FEEDS = [
 ]
 
 POSTED_FILE = "posted.txt"
-KEYWORDS = ["web3", "blockchain", "crypto", "solidity", "nft", "defi", "ethereum", "rust", "smart contract"]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# --- Environment Variables (from GitHub Secrets) ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ========= HELPERS =========
+openai.api_key = OPENAI_API_KEY
 
+
+# --- Load posted links ---
 def load_posted():
     if not os.path.exists(POSTED_FILE):
         return set()
-    with open(POSTED_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f.readlines())
+    with open(POSTED_FILE, "r") as f:
+        return set(line.strip() for line in f if line.strip())
 
-def save_posted(posted_set):
-    with open(POSTED_FILE, "w", encoding="utf-8") as f:
-        for url in posted_set:
-            f.write(url + "\n")
 
-def fetch_jobs():
-    jobs = []
-    for feed_url in FEEDS:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries:
-                title = entry.get("title", "")
-                summary = entry.get("summary", "")
-                link = entry.get("link", "")
-                published = entry.get("published_parsed")
+# --- Save posted links ---
+def save_posted(posted):
+    with open(POSTED_FILE, "w") as f:
+        f.write("\n".join(posted))
 
-                # Filter old jobs (older than 5 days)
-                if published:
-                    published_date = datetime(*published[:6])
-                    if datetime.utcnow() - published_date > timedelta(days=5):
-                        continue
 
-                lower = f"{title} {summary}".lower()
-                if any(k in lower for k in KEYWORDS):
-                    jobs.append({
-                        "title": title,
-                        "description": summary,
-                        "link": link,
-                        "company": entry.get("author", "Company")
-                    })
-        except Exception as e:
-            print(f"Error fetching from {feed_url}: {e}")
-    return jobs
-
-def scrape_job_page(url):
-    """Fetch webpage content for better description."""
+# --- Scrape job page for more content ---
+def scrape_page(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return ""
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try to extract meaningful text
-        paragraphs = soup.find_all(["p", "li"])
-        text = " ".join([p.get_text(" ", strip=True) for p in paragraphs])
-        text = " ".join(text.split())
-        return text[:1500]  # limit tokens
-    except Exception as e:
-        print(f"Scrape failed for {url}: {e}")
-        return ""
+        # Try to find a short meaningful text
+        paragraphs = soup.find_all("p")
+        text = " ".join(p.get_text().strip() for p in paragraphs[:5])
+        return text[:1000] if text else "No detailed description found."
+    except Exception:
+        return "No detailed description available."
 
-def call_openai_summary(title, company, description):
-    """Use GPT to summarize and generate 2 job-specific hashtags."""
+
+# --- Summarize job using GPT ---
+def summarize_with_gpt(title, company, content):
     prompt = f"""
+Summarize the job posting below in one short professional paragraph (max 50 words).
 Job Title: {title}
 Company: {company}
-Job Description: {description}
+Description: {content}
 
-Create a short, professional 2-sentence summary of the role suitable for a Telegram post.
-Then, generate two relevant hashtags (e.g. #FrontendDeveloper #FinTech) that fit this role.
-Output in this format:
-Summary: <text>
-Hashtags: #tag1 #tag2
+Then suggest exactly 2 relevant short hashtags (no # sign, just words) fitting the job type or field.
+Return as JSON with fields: "summary" and "hashtags".
 """
     try:
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
-            temperature=0.7,
+            temperature=0.5,
         )
-        content = response.choices[0].message.content.strip()
-        summary, hashtags = "", ""
-        if "Summary:" in content:
-            parts = content.split("Hashtags:")
-            summary = parts[0].replace("Summary:", "").strip()
-            if len(parts) > 1:
-                hashtags = parts[1].strip()
-        return summary, hashtags
+        text = response["choices"][0]["message"]["content"]
+        # Extract summary + hashtags manually if not JSON formatted
+        summary, hashtags = text, []
+        if "{" in text and "}" in text:
+            import json
+            try:
+                parsed = json.loads(text)
+                summary = parsed.get("summary", summary)
+                hashtags = parsed.get("hashtags", [])
+            except Exception:
+                pass
+        return summary.strip(), hashtags
     except Exception as e:
         print("OpenAI error:", e)
-        return description[:200], ""
+        return "Short job summary unavailable.", []
 
-def escape_md(text):
-    """Escape Telegram MarkdownV2 reserved characters."""
-    for ch in "_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
 
-def format_for_telegram(job, summary, hashtags):
-    title = escape_md(job.get("title", "Job Opening"))
-    company = escape_md(job.get("company", "Company"))
-    link = job.get("link", "").strip()
-    about = escape_md(summary)
-
-    base_tags = "#XCROO #OnChainTalent #Web3Jobs"
-    all_tags = f"{base_tags} {hashtags}"
-
-    formatted = (
-        f"*XCROO Job Update*\n\n"
-        f"*{company}* is hiring [{title}]({link})\n\n"
-        f"*About:* {about}\n\n"
-        f"{all_tags}"
-    )
-    return formatted
-
-def send_telegram(message):
+# --- Send to Telegram ---
+def send_to_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "MarkdownV2",
-        "disable_web_page_preview": True,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False,
     }
     r = requests.post(url, json=payload)
     if not r.ok:
-        print("Telegram Error:", r.text)
-    else:
-        print("✅ Posted successfully")
+        print("Telegram error:", r.text)
 
-# ========= MAIN =========
 
+# --- Format post ---
+def format_post(title, link, company, summary, hashtags):
+    hashtag_text = " ".join([f"#{tag}" for tag in (['XCROO', 'OnChainTalent', 'Web3Jobs'] + hashtags)])
+    msg = f"*XCROO Job Update*\n\n*{company}* is hiring [{title}]({link})\n\n*About:* {summary}\n\n{hashtag_text}"
+    return msg
+
+
+# --- Main loop ---
 def main():
-    print(f"\nXCROO BOT RUN STARTED: {datetime.utcnow()} UTC")
     posted = load_posted()
-    jobs = fetch_jobs()
-    new_jobs = [job for job in jobs if job["link"] not in posted]
-    print(f"Fetched {len(jobs)} total, {len(new_jobs)} new.")
+    new_posted = set(posted)
 
-    for job in new_jobs:
-        print(f"Processing: {job['title']}")
-        scraped_text = scrape_job_page(job["link"]) or job["description"]
-        summary, hashtags = call_openai_summary(job["title"], job["company"], scraped_text)
-        message = format_for_telegram(job, summary, hashtags)
-        send_telegram(message)
-        posted.add(job["link"])
-        time.sleep(5)
+    for feed_url in FEEDS:
+        print(f"Fetching {feed_url} ...")
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries:
+            link = entry.link
+            if link in posted:
+                continue
 
-    save_posted(posted)
-    print("XCROO BOT RUN COMPLETE ✅")
+            title = entry.title if hasattr(entry, "title") else "Untitled Role"
+            company = (
+                getattr(entry, "author", None)
+                or getattr(entry, "source", None)
+                or "Company not specified"
+            )
+
+            description = scrape_page(link)
+            summary, hashtags = summarize_with_gpt(title, company, description)
+            message = format_post(title, link, company, summary, hashtags)
+            send_to_telegram(message)
+            print(f"Posted: {title}")
+
+            new_posted.add(link)
+            time.sleep(3)  # small delay to avoid spam rate-limits
+
+    save_posted(new_posted)
+    print("✅ Done!")
+
 
 if __name__ == "__main__":
     main()
+
+
