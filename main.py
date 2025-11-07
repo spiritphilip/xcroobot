@@ -42,7 +42,7 @@ def rotate_openai_call(prompt):
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=180,
+                max_tokens=100,
                 temperature=0.7,
             )
             return response.choices[0].message.content.strip()
@@ -50,21 +50,6 @@ def rotate_openai_call(prompt):
             print(f"⚠️ Key {key[:8]} failed → {e}")
             continue
     return "Summary unavailable due to API limits."
-
-def get_page_summary(url):
-    """Scrape webpage and summarize with AI"""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        prompt = (
-            f"Summarize this job post in one short professional line:\n{text[:4000]}\n\n"
-            "Make it concise, informative, and fit for job seekers."
-        )
-        return rotate_openai_call(prompt)
-    except Exception as e:
-        print(f"❌ Scrape failed for {url}: {e}")
-        return "Short summary not available."
 
 def post_to_telegram(message):
     """Send formatted message to Telegram"""
@@ -105,18 +90,16 @@ for feed_url in FEEDS:
         if not any(k.lower() in title.lower() for k in KEYWORDS):
             continue
 
-        desc = get_page_summary(link)
-
-        # Add 2 smart hashtags using AI
+        # Generate 2 relevant hashtags
         hashtags_prompt = f"Generate two relevant short hashtags for this job: '{title}' by {company}. Keep them one or two words."
         hashtags = rotate_openai_call(hashtags_prompt)
         hashtags = hashtags.replace("#", "").replace(" ", "")
         hashtags = " ".join([f"#{h}" for h in hashtags.split()[:2]])
 
+        # Final Telegram message without 'About' section
         message = (
             f"*XCROO Job Update*\n\n"
             f"*{company}* is hiring [{title}]({link})\n\n"
-            f"*About:* {desc}\n\n"
             f"#XCROO #OnChainTalent #Web3Jobs {hashtags}"
         )
 
