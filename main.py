@@ -9,6 +9,7 @@ import csv
 # ====== CONFIG ======
 FEEDS = [
      "https://www.remote3.co/api/rss",
+     "https://www.workable.com/boards/workable.xml",
     "https://api.cryptojobslist.com/jobs.rss",
     "https://remotive.com/remote-jobs/feed",
     "https://linkedin.com/jobs/search?keywords=&location=Worldwide&geoId=92000000&trk=public_jobs_jobs-search-bar_search-submit"
