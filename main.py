@@ -64,7 +64,7 @@ def post_to_telegram(message):
 
 
 def normalize_url(raw_url):
-    """Return a simple canonical url for deduping:
+    """Return a simple canonical url for deduplication:
        - normalize scheme to https
        - drop 'www.' prefix
        - drop query and fragment
@@ -100,6 +100,7 @@ def append_posted_atomic(link):
         try:
             os.fsync(f.fileno())
         except Exception:
+            # fsync may not be supported on all filesystems; non-critical for this use case
             pass
 
 
@@ -113,6 +114,9 @@ def save_posted(ids):
 
 
 def make_hashtags_from_model(title, company):
+    # Pattern to match hashtag tokens: one or two words containing letters, numbers, +, -, _
+    HASHTAG_TOKEN_PATTERN = r"[A-Za-z0-9_+\-]+(?:\s+[A-Za-z0-9_+\-]+)?"
+    
     # Stronger prompt asking for a deterministic response
     prompt = (
         f"Generate exactly two short hashtags (no explanation), for this job:\n"
@@ -128,7 +132,7 @@ def make_hashtags_from_model(title, company):
     if "," in resp:
         tokens = [t.strip() for t in resp.split(",") if t.strip()]
     else:
-        tokens = re.findall(r"[A-Za-z0-9_+\-]+(?:\s+[A-Za-z0-9_+\-]+)?", resp)
+        tokens = re.findall(HASHTAG_TOKEN_PATTERN, resp)
         tokens = [t.strip() for t in tokens if t.strip()]
     tokens = tokens[:2]
     tokens = [re.sub(r"\s+", "", t) for t in tokens]
@@ -145,6 +149,7 @@ for feed_url in FEEDS:
     feed = feedparser.parse(feed_url)
 
     for entry in feed.entries[:6]:  # process top 6 per feed
+        # Try link first, fallback to id, then empty string if neither exists
         raw_link = getattr(entry, "link", None) or getattr(entry, "id", None) or ""
         canonical_link = normalize_url(raw_link)
         if not canonical_link:
