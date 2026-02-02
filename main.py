@@ -99,6 +99,7 @@ def append_posted_atomic(link):
         try:
             os.fsync(f.fileno())
         except Exception:
+            # fsync may not be available on all platforms, gracefully degrade
             pass
 
 
@@ -125,11 +126,15 @@ def make_hashtags_from_model(title, company):
     resp = resp.replace("#", "")
     tokens = []
     if "," in resp:
+        # Comma-first strategy: split on commas (e.g., "Web3, Blockchain")
         tokens = [t.strip() for t in resp.split(",") if t.strip()]
     else:
+        # Fallback: use regex to match one or two word phrases (e.g., "Web3 Developer")
+        # The pattern matches multi-word tags, which we then condense by removing spaces
         tokens = re.findall(r"[A-Za-z0-9_+\-]+(?:\s+[A-Za-z0-9_+\-]+)?", resp)
         tokens = [t.strip() for t in tokens if t.strip()]
     tokens = tokens[:2]
+    # Remove internal spaces to create hashtags like #Web3Developer from "Web3 Developer"
     tokens = [re.sub(r"\s+", "", t) for t in tokens]
     return " ".join(f"#{t}" for t in tokens)
 
