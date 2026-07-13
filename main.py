@@ -59,13 +59,13 @@ MAX_POSTED = 8000            # keep dedup file from growing forever (keeps newes
 # ---- Volume + pacing (env-overridable so the workflow can tune per run) ----
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))         # total items per run
 WINDOW_MINUTES = float(os.getenv("WINDOW_MINUTES", "50"))  # spread posts over this
-MIN_GAP = 6                  # min seconds between posts (Telegram-friendly)
-MAX_GAP = 120                # max seconds between posts
+MIN_GAP = 6                  # min seconds between batch posts (Telegram-friendly)
+MAX_GAP = 120                # max seconds between batch posts
 ENTRIES_PER_SOURCE = int(os.getenv("ENTRIES_PER_SOURCE", "30"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))  # items bundled into one message
 
-# Per-category caps per run — jobs get the biggest share (this is a job channel).
-# Cap sum (105) is >= MAX_PER_RUN so a full 100 can be filled, jobs-weighted.
-CATEGORY_CAP = {"job": 45, "hackathon": 18, "grant": 18, "bounty": 12, "offer": 12}
+# Per-category caps per run — jobs dominate heavily (this is a job channel).
+CATEGORY_CAP = {"job": 60, "hackathon": 12, "grant": 12, "bounty": 8, "offer": 8}
 CATEGORY_ORDER = ["job", "hackathon", "grant", "bounty", "offer"]
 
 HEADERS = {
@@ -99,17 +99,45 @@ X_TAGS = {
     "grant": "#Grants #XCROO", "bounty": "#Bounty #XCROO", "offer": "#Opportunity #XCROO",
 }
 
-# Extra hashtags derived from the title (word-boundary matched).
+# Hashtags derived from the item titles (word-boundary matched). Covers skills,
+# stacks AND roles so a batch's tags reflect what's actually in it.
 KEYWORD_TAGS = {
+    # stacks / skills
     "solidity": "#Solidity", "rust": "#Rust", "python": "#Python",
-    "react": "#React", "frontend": "#Frontend", "backend": "#Backend",
-    "fullstack": "#FullStack", "full-stack": "#FullStack", "devops": "#DevOps",
-    "smart contract": "#SmartContracts", "defi": "#DeFi", "nft": "#NFT",
-    "ethereum": "#Ethereum", "solana": "#Solana", "bitcoin": "#Bitcoin",
-    "zk": "#ZK", "ai": "#AI", "machine learning": "#ML", "data": "#Data",
-    "design": "#Design", "marketing": "#Marketing", "community": "#Community",
-    "security": "#Security", "audit": "#Audit", "blockchain": "#Blockchain",
-    "web3": "#Web3", "crypto": "#Crypto",
+    "golang": "#Go", "javascript": "#JavaScript", "typescript": "#TypeScript",
+    "react": "#React", "node": "#NodeJS", "smart contract": "#SmartContracts",
+    "defi": "#DeFi", "nft": "#NFT", "ethereum": "#Ethereum", "solana": "#Solana",
+    "bitcoin": "#Bitcoin", "zk": "#ZK", "ai": "#AI", "machine learning": "#ML",
+    "data": "#Data", "blockchain": "#Blockchain", "web3": "#Web3",
+    "crypto": "#Crypto", "audit": "#Audit", "security": "#Security",
+    # roles / functions
+    "frontend": "#Frontend", "front-end": "#Frontend", "backend": "#Backend",
+    "back-end": "#Backend", "fullstack": "#FullStack", "full-stack": "#FullStack",
+    "full stack": "#FullStack", "devops": "#DevOps", "mobile": "#Mobile",
+    "ios": "#iOS", "android": "#Android", "engineer": "#Engineer",
+    "developer": "#Developer", "designer": "#Design", "design": "#Design",
+    "product manager": "#ProductManager", "product": "#Product",
+    "manager": "#Manager", "marketing": "#Marketing", "content": "#Content",
+    "writer": "#Writing", "community": "#Community", "analyst": "#Analyst",
+    "research": "#Research", "sales": "#Sales", "operations": "#Ops",
+    "internship": "#Internship", "intern": "#Internship", "growth": "#Growth",
+}
+
+# Batch (digest) post labels + base category hashtags.
+CATEGORY_BATCH_LABEL = {
+    "job": "Job Openings", "hackathon": "Hackathons", "grant": "Grants & Funding",
+    "bounty": "Bounties", "offer": "Opportunities",
+}
+CATEGORY_HASH = {
+    "job": "#Jobs #Hiring #Web3Jobs", "hackathon": "#Hackathons #BuildWeb3",
+    "grant": "#Grants #Funding", "bounty": "#Bounties #BugBounty",
+    "offer": "#Opportunities #Fellowships",
+}
+# Feed/source names that are NOT the hiring company (so we parse the title instead).
+FEED_NAMES = {
+    "remote3", "weworkremotely", "jobicy", "himalayas", "remoteok", "remotive",
+    "jobspresso", "cryptocurrencyjobs", "news", "devpost", "dorahacks",
+    "company not specified", "",
 }
 
 # Tech relevance filter (word boundaries) — applied only to broad sources.
@@ -244,54 +272,10 @@ _KW_PATTERNS = [
 ]
 
 
-def extra_hashtags(title):
-    tags = []
-    for pat, tag in _KW_PATTERNS:
-        if pat.search(title) and tag not in tags:
-            tags.append(tag)
-        if len(tags) >= 2:
-            break
-    return " ".join(tags)
-
-
 def clean_gnews_title(title, publisher):
     if publisher and title.endswith(" - " + publisher):
         return title[: -(len(publisher) + 3)].strip()
     return re.sub(r"\s+-\s+[^-]+$", "", title).strip() if " - " in title else title
-
-
-def ai_hook(item):
-    """Optional short hook via Gemini. Returns '' on any problem."""
-    if not GEMINI_API_KEY:
-        return ""
-    try:
-        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
-        prompt = (
-            f"Write ONE short punchy hook (6-11 words) to introduce this "
-            f"{item['cat']} update on 'XCROO', a Web3 & tech opportunities "
-            f"Telegram channel. Be energetic. No emojis, no hashtags, no quotes, "
-            f"no preamble — just the hook.\n"
-            f"Title: {item['title']}\nOrg/source: {item['org']}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.9,
-                "maxOutputTokens": 40,
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            return ""
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        hook = text.strip().split("\n")[0]
-        hook = hook.replace("*", "").replace("`", "").replace('"', "").strip()
-        hook = hook.strip("-–—: ").strip()
-        return hook[:90]
-    except Exception:
-        return ""
 
 
 # =========================
@@ -378,31 +362,96 @@ FETCHERS = {
 # =========================
 
 
-def build_message(item):
-    cat = item["cat"]
-    emoji, label, _lead = CATEGORY_META.get(cat, ("📣", "Update", ""))
-    org = html.escape((item["org"] or "").strip()[:80])
-    title = html.escape(item["title"].strip()[:200])
-    link = html.escape(item["link"], quote=True)
-    tags = (CATEGORY_TAGS.get(cat, "#XCROO") + " " + extra_hashtags(item["title"])).strip()
+_ATS_RE = re.compile(
+    r"\s*\|\s*(SmartRecruiters|Lever|Greenhouse|Workable|Ashby|BambooHR|Jobgether|Rippling)\b.*$",
+    re.IGNORECASE,
+)
 
-    lines = [f"{emoji} <b>XCROO • {label}</b>"]
-    hook = item.get("hook")
-    if hook:
-        lines.append(f"<i>{html.escape(hook)}</i>")
-    lines.append("")
 
-    if cat == "job":
-        who = f"<b>{org}</b> " if org else ""
-        lines.append(f"🏢 {who}is hiring")
-        lines.append(f"👉 <a href=\"{link}\">{title}</a>")
+def job_company_role(item):
+    """Best-effort split of a job item into (company, role). Company is '' when
+    it can't be determined confidently."""
+    title = item["title"].strip()
+    org = (item["org"] or "").strip()
+    company, role = "", title
+    if org and org.lower() not in FEED_NAMES:
+        company, role = org, title
     else:
-        lines.append(f"👉 <a href=\"{link}\">{title}</a>")
-        if org and org.lower() not in ("news", ""):
-            lines.append(f"<i>via {org}</i>")
+        m = re.match(r"^([^:]{2,40}):\s+(.{4,})$", title)          # "Company: Role"
+        if m:
+            company, role = m.group(1).strip(), m.group(2).strip()
+        else:
+            m = re.search(r"^(.{4,}?)\s+at\s+([A-Z][\w .,&'/-]{1,40})$", title)  # "Role at Company"
+            if m:
+                company, role = m.group(2).strip(), m.group(1).strip()
+    role = _ATS_RE.sub("", role).strip()                           # drop "| SmartRecruiters ..."
+    if company and role.lower().startswith(company.lower()):        # drop repeated company prefix
+        role = role[len(company):].strip(" -:|·")
+    return company, (role or title)
 
+
+def item_line(item):
+    link = html.escape(item["link"], quote=True)
+    if item["cat"] == "job":
+        company, role = job_company_role(item)
+        role = html.escape(role[:130])
+        if company:
+            return f"🔹 <b>{html.escape(company[:45])}</b> is hiring <a href=\"{link}\">{role}</a>"
+        return f"🔹 <a href=\"{link}\">{role}</a>"
+    title = html.escape(item["title"].strip()[:150])
+    org = (item["org"] or "").strip()
+    if item["cat"] == "hackathon" and org and org.lower() not in ("news", ""):
+        return f"🔹 <a href=\"{link}\">{title}</a> — {html.escape(org[:30])}"
+    return f"🔹 <a href=\"{link}\">{title}</a>"
+
+
+def batch_hashtags(cat, items):
+    """Base category tags + up to 6 skill/role tags reflecting the batch."""
+    skills = []
+    for it in items:
+        for pat, tag in _KW_PATTERNS:
+            if tag not in skills and pat.search(it["title"]):
+                skills.append(tag)
+    return (f"#XCROO {CATEGORY_HASH.get(cat, '')} " + " ".join(skills[:6])).strip()
+
+
+def ai_batch_intro(cat, items):
+    """Optional one-line intro via Gemini. Returns '' on any problem."""
+    if not GEMINI_API_KEY:
+        return ""
+    titles = "; ".join(it["title"][:55] for it in items[:BATCH_SIZE])
+    prompt = (
+        f"In 6-11 words, write ONE energetic intro line for a batch of {cat} "
+        f"posts on 'XCROO', a Web3 & tech opportunities Telegram channel. "
+        f"No emojis, no hashtags, no quotes, just the line. Based on: {titles}"
+    )
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+        payload = {"contents": [{"parts": [{"text": prompt}]}],
+                   "generationConfig": {"temperature": 0.9, "maxOutputTokens": 40,
+                                        "thinkingConfig": {"thinkingBudget": 0}}}
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            return ""
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        line = text.strip().split("\n")[0].replace("*", "").replace("`", "").replace('"', "")
+        return line.strip("-–—: ").strip()[:90]
+    except Exception:
+        return ""
+
+
+def build_batch_message(cat, items):
+    emoji = CATEGORY_META.get(cat, ("📣",))[0]
+    label = CATEGORY_BATCH_LABEL.get(cat, "Updates")
+    lines = [f"{emoji} <b>XCROO • {label}</b> ({len(items)})"]
+    intro = ai_batch_intro(cat, items) if not DRY_RUN else ""
+    if intro:
+        lines.append(f"<i>{html.escape(intro)}</i>")
     lines.append("")
-    lines.append(tags)
+    lines.extend(item_line(it) for it in items)
+    lines.append("")
+    lines.append(batch_hashtags(cat, items))
     lines.append("")
     lines.append("⚡ <b>Powered by XCROO</b> — Web3 &amp; Tech Opportunities")
     return "\n".join(lines)
@@ -527,29 +576,45 @@ def crosspost_to_x(by_cat):
 # =========================
 
 
-def select_batch(by_cat):
+def select_grouped(by_cat):
     """Round-robin across categories (respecting caps) up to MAX_PER_RUN,
-    then shuffle into a random posting order."""
+    returning items grouped per category (kept in source/newest order)."""
     idx = {c: 0 for c in CATEGORY_ORDER}
-    taken = {c: 0 for c in CATEGORY_ORDER}
-    chosen = []
-    while len(chosen) < MAX_PER_RUN:
+    picked = {c: [] for c in CATEGORY_ORDER}
+    total = 0
+    while total < MAX_PER_RUN:
         progressed = False
         for c in CATEGORY_ORDER:
-            if len(chosen) >= MAX_PER_RUN:
+            if total >= MAX_PER_RUN:
                 break
-            if taken[c] >= CATEGORY_CAP.get(c, 0):
+            if len(picked[c]) >= CATEGORY_CAP.get(c, 0):
                 continue
             lst = by_cat.get(c, [])
             if idx[c] < len(lst):
-                chosen.append(lst[idx[c]])
+                picked[c].append(lst[idx[c]])
                 idx[c] += 1
-                taken[c] += 1
+                total += 1
                 progressed = True
         if not progressed:
             break
-    random.shuffle(chosen)
-    return chosen, taken
+    return picked, total
+
+
+def build_batches(picked):
+    """Chunk each category into BATCH_SIZE groups, then interleave the batches
+    round-robin (jobs recur most since they have the most batches)."""
+    per_cat = {}
+    for c in CATEGORY_ORDER:
+        items = picked.get(c, [])
+        per_cat[c] = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    ordered = []
+    i = 0
+    while any(i < len(per_cat[c]) for c in CATEGORY_ORDER):
+        for c in CATEGORY_ORDER:
+            if i < len(per_cat[c]):
+                ordered.append((c, per_cat[c][i]))
+        i += 1
+    return ordered
 
 
 # =========================
@@ -593,28 +658,28 @@ def main():
     # 2) Cross-post a small jobs-first slice to X/Twitter (quick, before the drip).
     crosspost_to_x(by_cat)
 
-    # 3) Select a balanced, shuffled batch for Telegram.
-    selection, taken = select_batch(by_cat)
-    print(f"📦 Queuing {len(selection)} to post this run "
-          f"({', '.join(f'{c}:{taken[c]}' for c in CATEGORY_ORDER if taken.get(c))})")
+    # 3) Select items (jobs-weighted) and group into batch (digest) messages.
+    picked, total = select_grouped(by_cat)
+    batches = build_batches(picked)
+    print(f"📦 {total} items in {len(batches)} batch posts "
+          f"({', '.join(f'{c}:{len(picked[c])}' for c in CATEGORY_ORDER if picked.get(c))})")
 
-    # 4) Pace: spread Telegram posts across the run window with randomized gaps.
-    n = len(selection)
+    # 4) Pace: spread the batch posts across the run window with randomized gaps.
+    n = len(batches)
     base_gap = (WINDOW_MINUTES * 60 / n) if n else 0
-    print(f"⏱️  ~{base_gap:.0f}s average gap between posts\n")
+    print(f"⏱️  ~{base_gap:.0f}s average gap between batch posts\n")
 
     newly = []
-    for i, it in enumerate(selection):
-        it["hook"] = ai_hook(it) if not DRY_RUN else ""
-        msg = build_message(it)
-        print(f"→ [{it['cat']}] {it['title'][:60]}")
+    for i, (cat, items) in enumerate(batches):
+        msg = build_batch_message(cat, items)
+        print(f"→ [{cat}] batch of {len(items)}")
         if DRY_RUN:
             print(msg + "\n" + "-" * 55)
-            newly.append(it["key"])
+            newly.extend(it["key"] for it in items)
             continue
         if post_to_telegram(msg):
-            newly.append(it["key"])
-            save_posted(posted_list + newly)   # persist after each post
+            newly.extend(it["key"] for it in items)
+            save_posted(posted_list + newly)   # persist after each batch
         if i < n - 1:
             gap = base_gap * random.uniform(0.6, 1.4)
             gap = max(MIN_GAP, min(MAX_GAP, gap))
