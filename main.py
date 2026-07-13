@@ -624,9 +624,12 @@ def crosspost_to_x(by_cat):
     # Jobs first, then the rest — only items still fresh this run.
     pool = [it for c in CATEGORY_ORDER for it in by_cat.get(c, []) if it["key"] not in keys]
     posted = 0
+    attempts = 0
+    max_attempts = remaining + 2   # small slack for transient failures — never walk the whole pool
     for it in pool:
-        if posted >= remaining:
+        if posted >= remaining or attempts >= max_attempts:
             break
+        attempts += 1
         msg = build_x_message(it)
         print(f"🐦 → [{it['cat']}] {it['title'][:55]}")
         if DRY_RUN:
@@ -638,7 +641,8 @@ def crosspost_to_x(by_cat):
             posted += 1
             save_posted_x(rows)
             time.sleep(3)
-    print(f"🐦 X: posted {posted} this run ({today_count + posted}/{X_DAILY_CAP} today)\n")
+    print(f"🐦 X: posted {posted}/{attempts} attempts this run "
+          f"({today_count + posted}/{X_DAILY_CAP} today)\n")
 
 
 # =========================
