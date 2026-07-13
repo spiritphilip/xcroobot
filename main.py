@@ -25,6 +25,7 @@ import sys
 import time
 import html
 import re
+import json
 import random
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, quote
@@ -278,6 +279,48 @@ def clean_gnews_title(title, publisher):
     return re.sub(r"\s+-\s+[^-]+$", "", title).strip() if " - " in title else title
 
 
+RESOLVE_GNEWS = os.getenv("RESOLVE_GNEWS", "1") != "0"
+_GN_CACHE = {}
+
+
+def resolve_gnews(url):
+    """Turn a news.google.com/rss/articles/... redirect into the real publisher
+    URL. Falls back to the original link on any failure. Cached per run."""
+    if not RESOLVE_GNEWS or "news.google.com" not in url:
+        return url
+    if url in _GN_CACHE:
+        return _GN_CACHE[url]
+    real = url
+    try:
+        art_id = urlparse(url).path.split("/")[-1]
+        r = requests.get(f"https://news.google.com/rss/articles/{art_id}",
+                         headers=HEADERS, timeout=15)
+        sg = re.search(r'data-n-a-sg="([^"]+)"', r.text)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', r.text)
+        if sg and ts:
+            inner = (
+                '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
+                'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+                f'"{art_id}",{ts.group(1)},"{sg.group(1)}"]'
+            )
+            payload = "f.req=" + quote(json.dumps([[["Fbv4je", inner]]]))
+            pr = requests.post(
+                "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                headers={"content-type": "application/x-www-form-urlencoded;charset=UTF-8"},
+                data=payload, timeout=15,
+            )
+            parts = pr.text.split("\n\n")
+            if len(parts) > 1:
+                for res in json.loads(parts[1]):
+                    if isinstance(res, list) and len(res) > 2 and res[0] == "wrb.fr" and res[2]:
+                        real = json.loads(res[2])[1] or url
+                        break
+    except Exception:
+        real = url
+    _GN_CACHE[url] = real
+    return real
+
+
 # =========================
 # SOURCE FETCHERS  -> list of {cat, title, org, link}
 # =========================
@@ -391,7 +434,7 @@ def job_company_role(item):
 
 
 def item_line(item):
-    link = html.escape(item["link"], quote=True)
+    link = html.escape(resolve_gnews(item["link"]), quote=True)
     if item["cat"] == "job":
         company, role = job_company_role(item)
         role = html.escape(role[:130])
@@ -517,7 +560,7 @@ def build_x_message(item):
     cat = item["cat"]
     lead = X_LEAD.get(cat, "📣").format(org=(item["org"] or "").strip()[:40])
     tags = X_TAGS.get(cat, "#XCROO")
-    link = item["link"]
+    link = resolve_gnews(item["link"])
     LINK_LEN = 23  # X wraps every URL to a 23-char t.co link
     fixed = len(lead) + 1 + 2 + LINK_LEN + 2 + len(tags)  # "lead " \n\n link \n\n tags
     room = max(12, 278 - fixed)
