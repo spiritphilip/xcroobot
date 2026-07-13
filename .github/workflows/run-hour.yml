@@ -7,7 +7,7 @@ on:
     inputs:
       max_per_run:
         description: "Max items to post this run"
-        default: "60"
+        default: "100"
       window_minutes:
         description: "Spread the posts across this many minutes"
         default: "50"
@@ -42,7 +42,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: gemini-2.5-flash
-          MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '60' }}
+          MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '100' }}
           WINDOW_MINUTES: ${{ github.event.inputs.window_minutes || '50' }}
         run: python main.py
 

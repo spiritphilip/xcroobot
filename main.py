@@ -47,14 +47,15 @@ POSTED_FILE = "posted.txt"
 MAX_POSTED = 8000            # keep dedup file from growing forever (keeps newest N)
 
 # ---- Volume + pacing (env-overridable so the workflow can tune per run) ----
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "60"))          # total items per run
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))         # total items per run
 WINDOW_MINUTES = float(os.getenv("WINDOW_MINUTES", "50"))  # spread posts over this
-MIN_GAP = 8                  # min seconds between posts (Telegram-friendly)
-MAX_GAP = 150                # max seconds between posts
-ENTRIES_PER_SOURCE = int(os.getenv("ENTRIES_PER_SOURCE", "25"))
+MIN_GAP = 6                  # min seconds between posts (Telegram-friendly)
+MAX_GAP = 120                # max seconds between posts
+ENTRIES_PER_SOURCE = int(os.getenv("ENTRIES_PER_SOURCE", "30"))
 
 # Per-category caps per run — jobs get the biggest share (this is a job channel).
-CATEGORY_CAP = {"job": 30, "hackathon": 10, "grant": 10, "bounty": 8, "offer": 8}
+# Cap sum (105) is >= MAX_PER_RUN so a full 100 can be filled, jobs-weighted.
+CATEGORY_CAP = {"job": 45, "hackathon": 18, "grant": 18, "bounty": 12, "offer": 12}
 CATEGORY_ORDER = ["job", "hackathon", "grant", "bounty", "offer"]
 
 HEADERS = {
