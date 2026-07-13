@@ -26,6 +26,7 @@ import time
 import html
 import re
 import random
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, quote
 
 import requests
@@ -42,6 +43,15 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Optional AI (Gemini) — graceful if missing.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Optional X/Twitter cross-post via upload-post.com — graceful if missing.
+# Posts a small curated (jobs-first) slice to a DEDICATED X account (a separate
+# upload-post profile). X throttles automation to ~20 posts/24h, so we cap low.
+UPLOAD_POST_API_KEY = os.getenv("UPLOAD_POST_API_KEY", "").strip()
+UPLOAD_POST_USER = os.getenv("UPLOAD_POST_USER", "xcroo")  # upload-post profile name
+POSTED_X_FILE = "posted_x.txt"
+X_DAILY_CAP = int(os.getenv("X_DAILY_CAP", "15"))          # max tweets per UTC day
+X_PER_RUN = int(os.getenv("X_PER_RUN", "1"))               # tweets per hourly run
 
 POSTED_FILE = "posted.txt"
 MAX_POSTED = 8000            # keep dedup file from growing forever (keeps newest N)
@@ -77,6 +87,16 @@ CATEGORY_TAGS = {
     "grant":     "#XCROO #Grants #Funding #Web3Grants #BuildersFund",
     "bounty":    "#XCROO #Bounty #BugBounty #EarnCrypto #Web3",
     "offer":     "#XCROO #Opportunity #Web3 #Tech #Fellowship",
+}
+
+# Compact X/Twitter templates (280-char budget, link counts as ~23).
+X_LEAD = {
+    "job": "💼 {org} is hiring:", "hackathon": "🏆 Hackathon:",
+    "grant": "💰 Grant:", "bounty": "🎯 Bounty:", "offer": "🚀 Opportunity:",
+}
+X_TAGS = {
+    "job": "#Web3Jobs #XCROO", "hackathon": "#Hackathon #XCROO",
+    "grant": "#Grants #XCROO", "bounty": "#Bounty #XCROO", "offer": "#Opportunity #XCROO",
 }
 
 # Extra hashtags derived from the title (word-boundary matched).
@@ -412,6 +432,97 @@ def post_to_telegram(message, disable_preview=True):
 
 
 # =========================
+# X / TWITTER (via upload-post.com)
+# =========================
+
+
+def _utc_today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def load_posted_x():
+    """Returns (rows, keyset, today_count). Rows are 'YYYY-MM-DD\\tkey'."""
+    if not os.path.exists(POSTED_X_FILE):
+        return [], set(), 0
+    rows, keys, today = [], set(), _utc_today()
+    today_count = 0
+    with open(POSTED_X_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            dt, _, key = line.partition("\t")
+            rows.append(line)
+            keys.add(key or dt)
+            if dt == today:
+                today_count += 1
+    return rows, keys, today_count
+
+
+def save_posted_x(rows):
+    with open(POSTED_X_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows[-MAX_POSTED:]) + "\n")
+
+
+def build_x_message(item):
+    cat = item["cat"]
+    lead = X_LEAD.get(cat, "📣").format(org=(item["org"] or "").strip()[:40])
+    tags = X_TAGS.get(cat, "#XCROO")
+    link = item["link"]
+    LINK_LEN = 23  # X wraps every URL to a 23-char t.co link
+    fixed = len(lead) + 1 + 2 + LINK_LEN + 2 + len(tags)  # "lead " \n\n link \n\n tags
+    room = max(12, 278 - fixed)
+    title = item["title"].strip()
+    if len(title) > room:
+        title = title[: room - 1].rstrip() + "…"
+    return f"{lead} {title}\n\n{link}\n\n{tags}"
+
+
+def post_to_x(message):
+    url = "https://api.upload-post.com/api/upload_text"
+    headers = {"Authorization": f"Apikey {UPLOAD_POST_API_KEY}"}
+    data = {"user": UPLOAD_POST_USER, "platform[]": "x", "title": message}
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=30)
+        j = r.json()
+        ok = bool(j.get("success")) and bool(j.get("results", {}).get("x", {}).get("success"))
+        info = j.get("results", {}).get("x", j)
+    except Exception as ex:
+        ok, info = False, f"{type(ex).__name__} {str(ex)[:100]}"
+    print(f"   {'🐦✅' if ok else '🐦❌'} X: {str(info)[:130]}")
+    return ok
+
+
+def crosspost_to_x(by_cat):
+    """Post a small jobs-first slice to the dedicated X account."""
+    if not UPLOAD_POST_API_KEY:
+        return
+    rows, keys, today_count = load_posted_x()
+    remaining = min(X_PER_RUN, max(0, X_DAILY_CAP - today_count))
+    if remaining <= 0:
+        print(f"🐦 X: daily cap reached ({today_count}/{X_DAILY_CAP})\n")
+        return
+    # Jobs first, then the rest — only items still fresh this run.
+    pool = [it for c in CATEGORY_ORDER for it in by_cat.get(c, []) if it["key"] not in keys]
+    posted = 0
+    for it in pool:
+        if posted >= remaining:
+            break
+        msg = build_x_message(it)
+        print(f"🐦 → [{it['cat']}] {it['title'][:55]}")
+        if DRY_RUN:
+            print("      " + msg.replace("\n", "\n      "))
+            posted += 1
+            continue
+        if post_to_x(msg):
+            rows.append(f"{_utc_today()}\t{it['key']}")
+            posted += 1
+            save_posted_x(rows)
+            time.sleep(3)
+    print(f"🐦 X: posted {posted} this run ({today_count + posted}/{X_DAILY_CAP} today)\n")
+
+
+# =========================
 # SELECTION
 # =========================
 
@@ -479,12 +590,15 @@ def main():
     total_fresh = sum(len(v) for v in by_cat.values())
     print(f"\n🆕 {total_fresh} fresh items available across {len(by_cat)} categories")
 
-    # 2) Select a balanced, shuffled batch.
+    # 2) Cross-post a small jobs-first slice to X/Twitter (quick, before the drip).
+    crosspost_to_x(by_cat)
+
+    # 3) Select a balanced, shuffled batch for Telegram.
     selection, taken = select_batch(by_cat)
     print(f"📦 Queuing {len(selection)} to post this run "
           f"({', '.join(f'{c}:{taken[c]}' for c in CATEGORY_ORDER if taken.get(c))})")
 
-    # 3) Pace: spread posts across the run window with randomized gaps.
+    # 4) Pace: spread Telegram posts across the run window with randomized gaps.
     n = len(selection)
     base_gap = (WINDOW_MINUTES * 60 / n) if n else 0
     print(f"⏱️  ~{base_gap:.0f}s average gap between posts\n")

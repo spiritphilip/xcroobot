@@ -41,6 +41,25 @@ Edit the knobs at the top of `main.py`:
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID`   | Channel ID (e.g. `@yourchannel` or `-100...`) — bot must be an admin |
+| `GEMINI_API_KEY`     | Google AI Studio key — powers the one-line AI hook (optional) |
+| `UPLOAD_POST_API_KEY`| upload-post.com API key — powers X/Twitter cross-post (optional) |
+
+## X / Twitter cross-post (optional)
+
+Posts a small, **jobs-first** slice to a dedicated X account via
+[upload-post.com](https://upload-post.com) (which absorbs X's per-post fee — the
+direct X API charges $0.20 per link-post in 2026). X throttles automation to
+~20 posts/24h, so the bot caps low.
+
+**To activate:**
+1. Have an active upload-post plan (Basic $16/mo covers 5 profiles, unlimited posts).
+2. In the upload-post dashboard, create a profile named **`xcroo`** and connect
+   your dedicated XCROO X account to it. (To use a different profile name, set the
+   `UPLOAD_POST_USER` env in the workflow.)
+3. Ensure the `UPLOAD_POST_API_KEY` secret is set.
+
+Tuning (workflow env): `X_DAILY_CAP` (default 15), `X_PER_RUN` (default 1 → one
+tweet per hourly run). Dedup is tracked separately in `posted_x.txt`.
 
 ## Run locally
 
