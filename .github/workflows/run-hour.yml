@@ -60,8 +60,16 @@ jobs:
           git add posted.txt posted_x.txt
           if git diff --cached --quiet; then
             echo "No new links to record."
-          else
-            git commit -m "chore: update posted list [skip ci]"
-            git pull --rebase --autostash origin master || true
-            git push
+            exit 0
           fi
+          git commit -m "chore: update posted list [skip ci]"
+          # posted*.txt use merge=union (.gitattributes), so rebasing our append
+          # onto origin auto-combines lines instead of conflicting. Retry on races.
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin master
+            git rebase -q origin/master || { git rebase --abort || true; echo "rebase aborted"; break; }
+            if git push -q origin HEAD:master; then
+              echo "Pushed on attempt $attempt"; exit 0
+            fi
+            echo "push race, retrying ($attempt)"; sleep 4
+          done

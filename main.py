@@ -27,6 +27,7 @@ import html
 import re
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, quote
 
@@ -198,14 +199,11 @@ SOURCES = [
     {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss"},
     {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss"},
     {"cat": "job", "type": "rss", "name": "Jobspresso",        "url": "https://jobspresso.co/?feed=job_feed", "strict": True},
-    {"cat": "job", "type": "gnews", "name": "Google News",     "url": gnews("web3 OR blockchain developer hiring remote")},
+    # (No Google News for jobs — direct boards above already give real links.)
 
-    # ---------- HACKATHONS ----------
-    {"cat": "hackathon", "type": "devpost",   "name": "Devpost", "pages": 4},
-    {"cat": "hackathon", "type": "dorahacks", "name": "DoraHacks","url": "https://dorahacks.io/api/hackathon/?page=1&size=20"},
-    {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("crypto OR web3 hackathon register 2026")},
-    {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("ETHGlobal OR blockchain hackathon prize pool")},
-    {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("AI hackathon 2026 registration open")},
+    # ---------- HACKATHONS (direct links only: Devpost + DoraHacks) ----------
+    {"cat": "hackathon", "type": "devpost",   "name": "Devpost", "pages": 5},
+    {"cat": "hackathon", "type": "dorahacks", "name": "DoraHacks","url": "https://dorahacks.io/api/hackathon/?page=1&size=25"},
 
     # ---------- GRANTS ----------
     {"cat": "grant", "type": "rss", "name": "OpportunityDesk",     "url": "https://opportunitydesk.org/feed/", "strict": True, "must": OPP_KEYWORDS},
@@ -280,12 +278,16 @@ def clean_gnews_title(title, publisher):
 
 
 RESOLVE_GNEWS = os.getenv("RESOLVE_GNEWS", "1") != "0"
+GNEWS_WORKERS = int(os.getenv("GNEWS_WORKERS", "4"))   # parallel decode workers
+GNEWS_TIMEOUT = int(os.getenv("GNEWS_TIMEOUT", "12"))  # per-request timeout
+# Consent cookie bypasses Google's EU/consent redirect wall.
+_GN_COOKIES = {"CONSENT": "YES+cb", "SOCS": "CAI"}
 _GN_CACHE = {}
 
 
 def resolve_gnews(url):
-    """Turn a news.google.com/rss/articles/... redirect into the real publisher
-    URL. Falls back to the original link on any failure. Cached per run."""
+    """Turn a news.google.com/articles/... redirect into the real publisher URL.
+    Returns the original link on any failure. Cached per run."""
     if not RESOLVE_GNEWS or "news.google.com" not in url:
         return url
     if url in _GN_CACHE:
@@ -293,8 +295,8 @@ def resolve_gnews(url):
     real = url
     try:
         art_id = urlparse(url).path.split("/")[-1]
-        r = requests.get(f"https://news.google.com/rss/articles/{art_id}",
-                         headers=HEADERS, timeout=15)
+        r = requests.get(f"https://news.google.com/articles/{art_id}",
+                         headers=HEADERS, cookies=_GN_COOKIES, timeout=GNEWS_TIMEOUT)
         sg = re.search(r'data-n-a-sg="([^"]+)"', r.text)
         ts = re.search(r'data-n-a-ts="([^"]+)"', r.text)
         if sg and ts:
@@ -306,8 +308,9 @@ def resolve_gnews(url):
             payload = "f.req=" + quote(json.dumps([[["Fbv4je", inner]]]))
             pr = requests.post(
                 "https://news.google.com/_/DotsSplashUi/data/batchexecute",
-                headers={"content-type": "application/x-www-form-urlencoded;charset=UTF-8"},
-                data=payload, timeout=15,
+                headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                         "User-Agent": HEADERS["User-Agent"]},
+                cookies=_GN_COOKIES, data=payload, timeout=GNEWS_TIMEOUT,
             )
             parts = pr.text.split("\n\n")
             if len(parts) > 1:
@@ -319,6 +322,24 @@ def resolve_gnews(url):
         real = url
     _GN_CACHE[url] = real
     return real
+
+
+def preresolve_gnews(items):
+    """Resolve all Google News links in `items` concurrently (once), storing the
+    result on each item as 'display_link'. Non-GN items keep their link."""
+    gn = [it for it in items if "news.google.com" in it["link"]]
+    for it in items:
+        it["display_link"] = it["link"]
+    if not RESOLVE_GNEWS or not gn:
+        return
+    def work(it):
+        it["display_link"] = resolve_gnews(it["link"])
+    with ThreadPoolExecutor(max_workers=max(1, GNEWS_WORKERS)) as ex:
+        list(ex.map(work, gn))
+    done = [it for it in gn if it["display_link"] != it["link"]]
+    print(f"🔗 Resolved {len(done)}/{len(gn)} Google News links to real sites")
+    if done:
+        print(f"    e.g. {done[0]['display_link'][:80]}")
 
 
 # =========================
@@ -434,7 +455,7 @@ def job_company_role(item):
 
 
 def item_line(item):
-    link = html.escape(resolve_gnews(item["link"]), quote=True)
+    link = html.escape(item.get("display_link", item["link"]), quote=True)
     if item["cat"] == "job":
         company, role = job_company_role(item)
         role = html.escape(role[:130])
@@ -560,7 +581,7 @@ def build_x_message(item):
     cat = item["cat"]
     lead = X_LEAD.get(cat, "📣").format(org=(item["org"] or "").strip()[:40])
     tags = X_TAGS.get(cat, "#XCROO")
-    link = resolve_gnews(item["link"])
+    link = item.get("display_link") or resolve_gnews(item["link"])
     LINK_LEN = 23  # X wraps every URL to a 23-char t.co link
     fixed = len(lead) + 1 + 2 + LINK_LEN + 2 + len(tags)  # "lead " \n\n link \n\n tags
     room = max(12, 278 - fixed)
@@ -574,13 +595,19 @@ def post_to_x(message):
     url = "https://api.upload-post.com/api/upload_text"
     headers = {"Authorization": f"Apikey {UPLOAD_POST_API_KEY}"}
     data = {"user": UPLOAD_POST_USER, "platform[]": "x", "title": message}
+    ok, info = False, ""
     try:
         r = requests.post(url, headers=headers, data=data, timeout=30)
-        j = r.json()
-        ok = bool(j.get("success")) and bool(j.get("results", {}).get("x", {}).get("success"))
-        info = j.get("results", {}).get("x", j)
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+        results = j.get("results") if isinstance(j, dict) else None
+        x = results.get("x") if isinstance(results, dict) else None
+        ok = bool(x.get("success")) if isinstance(x, dict) else False
+        info = x if x is not None else (j if j is not None else f"HTTP {r.status_code} {r.text[:100]}")
     except Exception as ex:
-        ok, info = False, f"{type(ex).__name__} {str(ex)[:100]}"
+        info = f"{type(ex).__name__} {str(ex)[:100]}"
     print(f"   {'🐦✅' if ok else '🐦❌'} X: {str(info)[:130]}")
     return ok
 
@@ -703,6 +730,8 @@ def main():
 
     # 3) Select items (jobs-weighted) and group into batch (digest) messages.
     picked, total = select_grouped(by_cat)
+    # Resolve any Google News links to the real publisher URL (parallel, once).
+    preresolve_gnews([it for c in CATEGORY_ORDER for it in picked.get(c, [])])
     batches = build_batches(picked)
     print(f"📦 {total} items in {len(batches)} batch posts "
           f"({', '.join(f'{c}:{len(picked[c])}' for c in CATEGORY_ORDER if picked.get(c))})")

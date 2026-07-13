@@ -1,0 +1,4 @@
+# Append-only dedup logs: auto-union on merge/rebase so concurrent runs
+# (or a code push racing a run's commit) never produce conflicts.
+posted.txt   merge=union
+posted_x.txt merge=union
