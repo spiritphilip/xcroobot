@@ -6,9 +6,16 @@ sources and posts fresh (never-before-seen) items to a Telegram channel.
 
 Web3-first, broadened to general tech.
 
+Volume + pacing: gathers ALL fresh items each run, balances across categories
+(jobs favored), shuffles them into a RANDOM queue, then drips them out spaced
+across the run window instead of dumping them all at once.
+
 Dedup: every item is keyed by a normalized URL and checked against posted.txt.
 posted.txt is committed back to the repo by the GitHub Action after each run,
 so a link is NEVER posted twice.
+
+Optional AI: if GEMINI_API_KEY is set, gemini-2.5-flash adds a short hook line
+to each post (fully graceful — the bot works fine without it).
 
 Run locally without posting:  python main.py --dry-run
 """
@@ -17,8 +24,8 @@ import os
 import sys
 import time
 import html
-import json
 import re
+import random
 from urllib.parse import urlparse, urlunparse, quote
 
 import requests
@@ -32,35 +39,46 @@ DRY_RUN = "--dry-run" in sys.argv or os.getenv("DRY_RUN") == "1"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Optional AI (Gemini) — graceful if missing.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
 POSTED_FILE = "posted.txt"
-MAX_POSTED = 4000        # keep dedup file from growing forever (keeps newest N)
-MAX_PER_RUN = 8          # total items to post per run (avoid flooding)
-MAX_PER_CATEGORY = 3     # balance so one category can't dominate a run
-MAX_PER_SOURCE = 4       # don't let a single source dominate
-SLEEP_BETWEEN = 4        # seconds between Telegram sends
-ENTRIES_PER_SOURCE = 12  # how many recent items to consider per source
+MAX_POSTED = 8000            # keep dedup file from growing forever (keeps newest N)
+
+# ---- Volume + pacing (env-overridable so the workflow can tune per run) ----
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "60"))          # total items per run
+WINDOW_MINUTES = float(os.getenv("WINDOW_MINUTES", "50"))  # spread posts over this
+MIN_GAP = 8                  # min seconds between posts (Telegram-friendly)
+MAX_GAP = 150                # max seconds between posts
+ENTRIES_PER_SOURCE = int(os.getenv("ENTRIES_PER_SOURCE", "25"))
+
+# Per-category caps per run — jobs get the biggest share (this is a job channel).
+CATEGORY_CAP = {"job": 30, "hackathon": 10, "grant": 10, "bounty": 8, "offer": 8}
+CATEGORY_ORDER = ["job", "hackathon", "grant", "bounty", "offer"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 }
 
-CATEGORY_EMOJI = {
-    "job": "💼", "hackathon": "🏆", "grant": "💰", "bounty": "🎯", "offer": "🚀",
-}
-CATEGORY_LABEL = {
-    "job": "Job Opening", "hackathon": "Hackathon", "grant": "Grant / Funding",
-    "bounty": "Bounty", "offer": "Opportunity",
+# emoji, label, "lead" verb phrase
+CATEGORY_META = {
+    "job":       ("💼", "Job Update",      "is hiring"),
+    "hackathon": ("🏆", "Hackathon Alert", "Build & win"),
+    "grant":     ("💰", "Grant & Funding", "Funding is open"),
+    "bounty":    ("🎯", "Bounty",          "Earn rewards"),
+    "offer":     ("🚀", "Opportunity",     "Now open"),
 }
 CATEGORY_TAGS = {
-    "job":       "#XCROO #Jobs #Web3Jobs #TechJobs",
-    "hackathon": "#XCROO #Hackathon #BuildWeb3 #Devpost",
-    "grant":     "#XCROO #Grants #Funding #Web3Grants",
-    "bounty":    "#XCROO #Bounty #BugBounty #EarnCrypto",
-    "offer":     "#XCROO #Opportunity #Web3 #Tech",
+    "job":       "#XCROO #Web3Jobs #TechJobs #Hiring #RemoteJobs",
+    "hackathon": "#XCROO #Hackathon #BuildWeb3 #Devpost #Hackers",
+    "grant":     "#XCROO #Grants #Funding #Web3Grants #BuildersFund",
+    "bounty":    "#XCROO #Bounty #BugBounty #EarnCrypto #Web3",
+    "offer":     "#XCROO #Opportunity #Web3 #Tech #Fellowship",
 }
 
-# Extra hashtags derived from the title (deterministic, no API needed)
+# Extra hashtags derived from the title (word-boundary matched).
 KEYWORD_TAGS = {
     "solidity": "#Solidity", "rust": "#Rust", "python": "#Python",
     "react": "#React", "frontend": "#Frontend", "backend": "#Backend",
@@ -73,8 +91,7 @@ KEYWORD_TAGS = {
     "web3": "#Web3", "crypto": "#Crypto",
 }
 
-# Tech relevance filter — applied only to broad sources (strict=True).
-# Matched with word boundaries so "ai" won't hit "email", "stem" won't hit "ecosystem".
+# Tech relevance filter (word boundaries) — applied only to broad sources.
 TECH_TERMS = [
     "web3", "crypto", "cryptocurrency", "blockchain", "bitcoin", "ethereum",
     "solana", "defi", "nft", "dao", "token", "smart contract", "developer",
@@ -89,8 +106,7 @@ _TECH_RE = re.compile(
     r"\b(" + "|".join(re.escape(t) for t in TECH_TERMS) + r")\b", re.IGNORECASE
 )
 
-# For noisy Google News feeds: the item title MUST contain one of these words,
-# so a category query can't drift into unrelated headlines.
+# For noisy Google News feeds: the item title MUST contain one of these words.
 GNEWS_MUST = {
     "job":       ["hiring", "hire", "job", "jobs", "role", "vacanc", "recruit", "career"],
     "hackathon": ["hackathon", "buildathon", "hackfest", "hacker house"],
@@ -101,8 +117,7 @@ GNEWS_MUST = {
                   "cohort", "residency", "apply", "application", "grant"],
 }
 
-# Opportunity keywords for broad RSS aggregators (OpportunityDesk etc.) so
-# they only yield actual programs/grants, not their blog articles.
+# Opportunity keywords for broad RSS aggregators (OpportunityDesk etc.).
 OPP_KEYWORDS = [
     "grant", "grants", "fund", "funding", "fellowship", "scholarship", "prize",
     "award", "program", "programme", "call for", "competition", "accelerator",
@@ -113,10 +128,12 @@ OPP_KEYWORDS = [
 # SOURCES
 # =========================
 # type: rss | gnews | devpost | dorahacks
-# strict=True  -> only keep items that mention a tech term (for broad feeds)
+# strict=True -> only keep tech items ; must=[...] -> require keyword in title
+
 
 def gnews(query):
     return f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+
 
 SOURCES = [
     # ---------- JOBS ----------
@@ -129,11 +146,13 @@ SOURCES = [
     {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-programming-jobs.rss"},
     {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss"},
     {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss"},
+    {"cat": "job", "type": "rss", "name": "WeWorkRemotely",    "url": "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss"},
+    {"cat": "job", "type": "rss", "name": "Jobspresso",        "url": "https://jobspresso.co/?feed=job_feed", "strict": True},
     {"cat": "job", "type": "gnews", "name": "Google News",     "url": gnews("web3 OR blockchain developer hiring remote")},
 
     # ---------- HACKATHONS ----------
-    {"cat": "hackathon", "type": "devpost",   "name": "Devpost", "pages": 3},
-    {"cat": "hackathon", "type": "dorahacks", "name": "DoraHacks","url": "https://dorahacks.io/api/hackathon/?page=1&size=15"},
+    {"cat": "hackathon", "type": "devpost",   "name": "Devpost", "pages": 4},
+    {"cat": "hackathon", "type": "dorahacks", "name": "DoraHacks","url": "https://dorahacks.io/api/hackathon/?page=1&size=20"},
     {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("crypto OR web3 hackathon register 2026")},
     {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("ETHGlobal OR blockchain hackathon prize pool")},
     {"cat": "hackathon", "type": "gnews", "name": "Google News", "url": gnews("AI hackathon 2026 registration open")},
@@ -160,6 +179,7 @@ SOURCES = [
 # =========================
 # DEDUP HELPERS
 # =========================
+
 
 def norm_url(url):
     """Normalize a URL so trivial variations map to the same dedup key."""
@@ -192,6 +212,7 @@ def save_posted(items):
 # CONTENT HELPERS
 # =========================
 
+
 def is_tech_relevant(text):
     return bool(_TECH_RE.search(text or ""))
 
@@ -213,15 +234,49 @@ def extra_hashtags(title):
 
 
 def clean_gnews_title(title, publisher):
-    """Google News titles look like 'Headline - Publisher' — strip the suffix."""
     if publisher and title.endswith(" - " + publisher):
         return title[: -(len(publisher) + 3)].strip()
     return re.sub(r"\s+-\s+[^-]+$", "", title).strip() if " - " in title else title
 
 
+def ai_hook(item):
+    """Optional short hook via Gemini. Returns '' on any problem."""
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+        prompt = (
+            f"Write ONE short punchy hook (6-11 words) to introduce this "
+            f"{item['cat']} update on 'XCROO', a Web3 & tech opportunities "
+            f"Telegram channel. Be energetic. No emojis, no hashtags, no quotes, "
+            f"no preamble — just the hook.\n"
+            f"Title: {item['title']}\nOrg/source: {item['org']}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.9,
+                "maxOutputTokens": 40,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            return ""
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        hook = text.strip().split("\n")[0]
+        hook = hook.replace("*", "").replace("`", "").replace('"', "").strip()
+        hook = hook.strip("-–—: ").strip()
+        return hook[:90]
+    except Exception:
+        return ""
+
+
 # =========================
 # SOURCE FETCHERS  -> list of {cat, title, org, link}
 # =========================
+
 
 def fetch_rss(src):
     items = []
@@ -257,7 +312,6 @@ def fetch_gnews(src):
         if src_obj is not None:
             publisher = getattr(src_obj, "title", "") or (src_obj.get("title", "") if hasattr(src_obj, "get") else "")
         title = clean_gnews_title(raw_title, publisher)
-        # Gate: the headline must actually mention the opportunity type.
         must = GNEWS_MUST.get(src["cat"])
         if must and not any(w in title.lower() for w in must):
             continue
@@ -275,8 +329,7 @@ def fetch_devpost(src):
             link = (h.get("url") or "").strip()
             if not title or not link:
                 continue
-            items.append({"cat": src["cat"], "title": title,
-                          "org": "Devpost", "link": link})
+            items.append({"cat": src["cat"], "title": title, "org": "Devpost", "link": link})
     return items
 
 
@@ -303,25 +356,38 @@ FETCHERS = {
 # TELEGRAM
 # =========================
 
+
 def build_message(item):
     cat = item["cat"]
-    emoji = CATEGORY_EMOJI.get(cat, "📣")
-    label = CATEGORY_LABEL.get(cat, "Update")
-    org = html.escape((item["org"] or "").strip()[:80]) or "—"
-    title = html.escape(item["title"].strip()[:180])
-    link = item["link"]
-    tags = CATEGORY_TAGS.get(cat, "#XCROO")
-    extra = extra_hashtags(item["title"])
-    tag_line = (tags + " " + extra).strip()
-    return (
-        f"{emoji} <b>{label}</b>\n\n"
-        f"<b>{org}</b>\n"
-        f'<a href="{html.escape(link, quote=True)}">{title}</a>\n\n'
-        f"{tag_line}"
-    )
+    emoji, label, _lead = CATEGORY_META.get(cat, ("📣", "Update", ""))
+    org = html.escape((item["org"] or "").strip()[:80])
+    title = html.escape(item["title"].strip()[:200])
+    link = html.escape(item["link"], quote=True)
+    tags = (CATEGORY_TAGS.get(cat, "#XCROO") + " " + extra_hashtags(item["title"])).strip()
+
+    lines = [f"{emoji} <b>XCROO • {label}</b>"]
+    hook = item.get("hook")
+    if hook:
+        lines.append(f"<i>{html.escape(hook)}</i>")
+    lines.append("")
+
+    if cat == "job":
+        who = f"<b>{org}</b> " if org else ""
+        lines.append(f"🏢 {who}is hiring")
+        lines.append(f"👉 <a href=\"{link}\">{title}</a>")
+    else:
+        lines.append(f"👉 <a href=\"{link}\">{title}</a>")
+        if org and org.lower() not in ("news", ""):
+            lines.append(f"<i>via {org}</i>")
+
+    lines.append("")
+    lines.append(tags)
+    lines.append("")
+    lines.append("⚡ <b>Powered by XCROO</b> — Web3 &amp; Tech Opportunities")
+    return "\n".join(lines)
 
 
-def post_to_telegram(message, disable_preview=False):
+def post_to_telegram(message, disable_preview=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -330,14 +396,54 @@ def post_to_telegram(message, disable_preview=False):
         "disable_web_page_preview": disable_preview,
     }
     r = requests.post(url, json=payload, timeout=25)
+    if r.status_code == 429:
+        retry = 5
+        try:
+            retry = int(r.json().get("parameters", {}).get("retry_after", 5))
+        except Exception:
+            pass
+        print(f"   ⏳ Rate limited, waiting {retry + 1}s")
+        time.sleep(retry + 1)
+        r = requests.post(url, json=payload, timeout=25)
     ok = r.status_code == 200
-    print(f"   {'✅' if ok else '❌'} Telegram {r.status_code}: {r.text[:120]}")
+    print(f"   {'✅' if ok else '❌'} Telegram {r.status_code}: {r.text[:110]}")
     return ok
+
+
+# =========================
+# SELECTION
+# =========================
+
+
+def select_batch(by_cat):
+    """Round-robin across categories (respecting caps) up to MAX_PER_RUN,
+    then shuffle into a random posting order."""
+    idx = {c: 0 for c in CATEGORY_ORDER}
+    taken = {c: 0 for c in CATEGORY_ORDER}
+    chosen = []
+    while len(chosen) < MAX_PER_RUN:
+        progressed = False
+        for c in CATEGORY_ORDER:
+            if len(chosen) >= MAX_PER_RUN:
+                break
+            if taken[c] >= CATEGORY_CAP.get(c, 0):
+                continue
+            lst = by_cat.get(c, [])
+            if idx[c] < len(lst):
+                chosen.append(lst[idx[c]])
+                idx[c] += 1
+                taken[c] += 1
+                progressed = True
+        if not progressed:
+            break
+    random.shuffle(chosen)
+    return chosen, taken
 
 
 # =========================
 # MAIN
 # =========================
+
 
 def main():
     if not DRY_RUN and (not TELEGRAM_TOKEN or not CHAT_ID):
@@ -345,7 +451,9 @@ def main():
         sys.exit(1)
 
     posted_list, posted_set = load_posted()
-    print(f"📁 Loaded {len(posted_set)} previously-posted links. DRY_RUN={DRY_RUN}")
+    print(f"📁 Loaded {len(posted_set)} previously-posted links. "
+          f"DRY_RUN={DRY_RUN} MAX_PER_RUN={MAX_PER_RUN} WINDOW={WINDOW_MINUTES}m "
+          f"AI={'on' if GEMINI_API_KEY else 'off'}")
 
     # 1) Collect candidates from every source (fault-isolated).
     by_cat = {}
@@ -356,7 +464,6 @@ def main():
         except Exception as ex:
             print(f"⚠️  Source failed [{src['cat']}/{src.get('name')}]: {type(ex).__name__} {str(ex)[:70]}")
             continue
-
         fresh = 0
         for it in items:
             key = norm_url(it["link"])
@@ -369,57 +476,41 @@ def main():
         print(f"📡 {src['cat']:9s} {src.get('name'):18s} -> {len(items):3d} items, {fresh} fresh")
 
     total_fresh = sum(len(v) for v in by_cat.values())
-    print(f"\n🆕 {total_fresh} fresh items across {len(by_cat)} categories")
+    print(f"\n🆕 {total_fresh} fresh items available across {len(by_cat)} categories")
 
-    # 2) Select a balanced batch: round-robin across categories.
-    selection = []
-    per_cat_count = {c: 0 for c in by_cat}
-    per_source_count = {}
-    cats = list(by_cat.keys())
-    idx = {c: 0 for c in cats}
-    while len(selection) < MAX_PER_RUN:
-        progressed = False
-        for c in cats:
-            if len(selection) >= MAX_PER_RUN:
-                break
-            if per_cat_count[c] >= MAX_PER_CATEGORY:
-                continue
-            lst = by_cat[c]
-            while idx[c] < len(lst):
-                it = lst[idx[c]]
-                idx[c] += 1
-                sc = per_source_count.get(it["org"], 0)
-                if sc >= MAX_PER_SOURCE:
-                    continue
-                selection.append(it)
-                per_cat_count[c] += 1
-                per_source_count[it["org"]] = sc + 1
-                progressed = True
-                break
-        if not progressed:
-            break
+    # 2) Select a balanced, shuffled batch.
+    selection, taken = select_batch(by_cat)
+    print(f"📦 Queuing {len(selection)} to post this run "
+          f"({', '.join(f'{c}:{taken[c]}' for c in CATEGORY_ORDER if taken.get(c))})")
 
-    print(f"📦 Selected {len(selection)} to post "
-          f"({', '.join(f'{c}:{per_cat_count[c]}' for c in cats if per_cat_count[c])})\n")
+    # 3) Pace: spread posts across the run window with randomized gaps.
+    n = len(selection)
+    base_gap = (WINDOW_MINUTES * 60 / n) if n else 0
+    print(f"⏱️  ~{base_gap:.0f}s average gap between posts\n")
 
-    # 3) Post + record.
     newly = []
-    for it in selection:
+    for i, it in enumerate(selection):
+        it["hook"] = ai_hook(it) if not DRY_RUN else ""
         msg = build_message(it)
-        print(f"→ [{it['cat']}] {it['title'][:65]}")
-        disable_preview = "news.google.com" in it["link"]
+        print(f"→ [{it['cat']}] {it['title'][:60]}")
         if DRY_RUN:
-            print(msg + "\n" + "-" * 50)
+            print(msg + "\n" + "-" * 55)
             newly.append(it["key"])
-        else:
-            if post_to_telegram(msg, disable_preview=disable_preview):
-                newly.append(it["key"])
-            time.sleep(SLEEP_BETWEEN)
+            continue
+        if post_to_telegram(msg):
+            newly.append(it["key"])
+            save_posted(posted_list + newly)   # persist after each post
+        if i < n - 1:
+            gap = base_gap * random.uniform(0.6, 1.4)
+            gap = max(MIN_GAP, min(MAX_GAP, gap))
+            time.sleep(gap)
 
-    if newly:
+    if newly and DRY_RUN:
+        pass  # don't write posted.txt in dry-run
+    elif newly:
         save_posted(posted_list + newly)
-        print(f"\n💾 Recorded {len(newly)} new links (posted.txt now has "
-              f"{min(len(posted_list) + len(newly), MAX_POSTED)}).")
+        print(f"\n💾 Recorded {len(newly)} new links "
+              f"(posted.txt now ~{min(len(posted_list) + len(newly), MAX_POSTED)}).")
     else:
         print("\n😴 Nothing new to post this cycle.")
 

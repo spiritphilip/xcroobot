@@ -4,12 +4,19 @@ on:
   schedule:
     - cron: "0 * * * *"   # hourly
   workflow_dispatch:
+    inputs:
+      max_per_run:
+        description: "Max items to post this run"
+        default: "60"
+      window_minutes:
+        description: "Spread the posts across this many minutes"
+        default: "50"
 
 # Allow the workflow to commit posted.txt back to the repo
 permissions:
   contents: write
 
-# Never let two runs overlap (they'd fight over posted.txt)
+# Never let two runs overlap (they'd fight over posted.txt / double-post)
 concurrency:
   group: xcroo-bot
   cancel-in-progress: false
@@ -17,6 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
 
@@ -32,9 +40,14 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-2.5-flash
+          MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '60' }}
+          WINDOW_MINUTES: ${{ github.event.inputs.window_minutes || '50' }}
         run: python main.py
 
       - name: Persist posted links (dedup memory)
+        if: always()   # keep progress even if the paced run is cancelled/times out
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -43,5 +56,6 @@ jobs:
             echo "No new links to record."
           else
             git commit -m "chore: update posted list [skip ci]"
+            git pull --rebase --autostash origin master || true
             git push
           fi
