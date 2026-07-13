@@ -2,23 +2,46 @@ name: Run Job Bot
 
 on:
   schedule:
-    - cron: "0 * * * *"  # hourly
+    - cron: "0 * * * *"   # hourly
   workflow_dispatch:
+
+# Allow the workflow to commit posted.txt back to the repo
+permissions:
+  contents: write
+
+# Never let two runs overlap (they'd fight over posted.txt)
+concurrency:
+  group: xcroo-bot
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run job bot
+
+      - name: Run XCROO bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
         run: python main.py
+
+      - name: Persist posted links (dedup memory)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posted.txt
+          if git diff --cached --quiet; then
+            echo "No new links to record."
+          else
+            git commit -m "chore: update posted list [skip ci]"
+            git push
+          fi
